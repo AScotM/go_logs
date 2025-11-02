@@ -51,12 +51,12 @@ func (e SecurityError) Error() string {
 }
 
 type RSyslogInfo struct {
-	Version           string
-	Features          map[string]bool
-	ConfigFile        string
-	PidFile           string
-	Platform          string
-	RainerscriptBits  int
+	Version          string
+	Features         map[string]bool
+	ConfigFile       string
+	PidFile          string
+	Platform         string
+	RainerscriptBits int
 }
 
 func (r *RSyslogInfo) DetectRSyslogInfo() bool {
@@ -81,7 +81,7 @@ func (r *RSyslogInfo) parseVersionOutput(output string) bool {
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		
+
 		if strings.HasPrefix(line, "Config file:") {
 			parts := strings.SplitN(line, ":", 2)
 			if len(parts) == 2 {
@@ -118,7 +118,7 @@ func (r *RSyslogInfo) detectFromSystem() bool {
 	output, err := cmd.CombinedOutput()
 	if err == nil && len(output) > 0 {
 		r.Version = "unknown (running)"
-		
+
 		possibleConfigs := []string{
 			"/etc/rsyslog.conf",
 			"/etc/rsyslog.d/",
@@ -135,22 +135,16 @@ func (r *RSyslogInfo) detectFromSystem() bool {
 	return false
 }
 
-func (r *RSyslogInfo) GetRecommendedPatterns() []struct {
+type PatternInfo struct {
 	Pattern     *regexp.Regexp
 	Type        string
 	Description string
-} {
-	patterns := []struct {
-		Pattern     *regexp.Regexp
-		Type        string
-		Description string
-	}{}
+}
 
-	patterns = append(patterns, struct {
-		Pattern     *regexp.Regexp
-		Type        string
-		Description string
-	}{
+func (r *RSyslogInfo) GetRecommendedPatterns() []PatternInfo {
+	patterns := []PatternInfo{}
+
+	patterns = append(patterns, PatternInfo{
 		Pattern: regexp.MustCompile(
 			`^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+` +
 				`(?P<time>\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+` +
@@ -160,11 +154,7 @@ func (r *RSyslogInfo) GetRecommendedPatterns() []struct {
 		Description: "Basic syslog format",
 	})
 
-	patterns = append(patterns, struct {
-		Pattern     *regexp.Regexp
-		Type        string
-		Description string
-	}{
+	patterns = append(patterns, PatternInfo{
 		Pattern: regexp.MustCompile(
 			`^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+` +
 				`(?P<time>\d{2}:\d{2}:\d{2})\s+` +
@@ -175,11 +165,7 @@ func (r *RSyslogInfo) GetRecommendedPatterns() []struct {
 	})
 
 	if r.Version != "" && r.versionCompare(r.Version, "8.0") >= 0 {
-		patterns = append(patterns, struct {
-			Pattern     *regexp.Regexp
-			Type        string
-			Description string
-		}{
+		patterns = append(patterns, PatternInfo{
 			Pattern: regexp.MustCompile(
 				`^(?P<timestamp>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?(?:\s+[+-]\d{4})?)\s+` +
 					`(?P<host>[\w\-.]+)\s+(?P<service>[\w\-.\/]+)(?:\[(?P<pid>\d+)\])?:\s*` +
@@ -188,11 +174,7 @@ func (r *RSyslogInfo) GetRecommendedPatterns() []struct {
 			Description: "ISO 8601 timestamp format",
 		})
 
-		patterns = append(patterns, struct {
-			Pattern     *regexp.Regexp
-			Type        string
-			Description string
-		}{
+		patterns = append(patterns, PatternInfo{
 			Pattern: regexp.MustCompile(
 				`^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+\d{4})\s+` +
 					`(?P<host>[\w\-.]+)\s+(?P<service>\w+)\[(?P<pid>\d+)\]:\s*` +
@@ -203,11 +185,7 @@ func (r *RSyslogInfo) GetRecommendedPatterns() []struct {
 	}
 
 	if r.Features["FEATURE_REGEXP"] {
-		patterns = append(patterns, struct {
-			Pattern     *regexp.Regexp
-			Type        string
-			Description string
-		}{
+		patterns = append(patterns, PatternInfo{
 			Pattern: regexp.MustCompile(
 				`^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[\d+-:]+)\s+` +
 					`(?P<host>\S+)\s+` +
@@ -285,32 +263,32 @@ func (r *RSyslogInfo) GetConfigRecommendations() map[string]string {
 }
 
 type AnalyzerConfig struct {
-	MaxDays            int
-	TruncateLength     int
-	ShowFullLines      bool
-	WrapLines          bool
-	MaxLinesPerService int
-	ColorOutput        bool
-	Verbose            bool
-	EnableAnalysis     bool
-	MaxFileSizeMB      int
+	MaxDays             int
+	TruncateLength      int
+	ShowFullLines       bool
+	WrapLines           bool
+	MaxLinesPerService  int
+	ColorOutput         bool
+	Verbose             bool
+	EnableAnalysis      bool
+	MaxFileSizeMB       int
 	UseRSyslogDetection bool
-	MaxMemoryEntries   int
+	MaxMemoryEntries    int
 }
 
 func NewDefaultConfig() *AnalyzerConfig {
 	return &AnalyzerConfig{
-		MaxDays:            30,
-		TruncateLength:     80,
-		ShowFullLines:      false,
-		WrapLines:          false,
-		MaxLinesPerService: 5,
-		ColorOutput:        true,
-		Verbose:            false,
-		EnableAnalysis:     false,
-		MaxFileSizeMB:      100,
+		MaxDays:             30,
+		TruncateLength:      80,
+		ShowFullLines:       false,
+		WrapLines:           false,
+		MaxLinesPerService:  5,
+		ColorOutput:         true,
+		Verbose:             false,
+		EnableAnalysis:      false,
+		MaxFileSizeMB:       100,
 		UseRSyslogDetection: true,
-		MaxMemoryEntries:   100000,
+		MaxMemoryEntries:    100000,
 	}
 }
 
@@ -348,21 +326,21 @@ func (l *LogEntry) IsError() bool {
 }
 
 type AnalysisResults struct {
-	TotalEntries      int
-	UniqueServices    map[string]bool
-	DateRange         [2]string
-	ServiceCounts     map[string]int
-	ErrorCount        int
-	LevelDistribution map[string]int
+	TotalEntries       int
+	UniqueServices     map[string]bool
+	DateRange          [2]string
+	ServiceCounts      map[string]int
+	ErrorCount         int
+	LevelDistribution  map[string]int
 	HourlyDistribution map[string]int
-	mu                sync.RWMutex
+	mu                 sync.RWMutex
 }
 
 func NewAnalysisResults() *AnalysisResults {
 	return &AnalysisResults{
-		UniqueServices:    make(map[string]bool),
-		ServiceCounts:     make(map[string]int),
-		LevelDistribution: make(map[string]int),
+		UniqueServices:     make(map[string]bool),
+		ServiceCounts:      make(map[string]int),
+		LevelDistribution:  make(map[string]int),
 		HourlyDistribution: make(map[string]int),
 	}
 }
@@ -465,25 +443,18 @@ func (e *ErrorClusterPlugin) GetResults() map[string]interface{} {
 }
 
 type LogParser struct {
-	CurrentYear      int
-	Verbose          bool
+	CurrentYear        int
+	Verbose            bool
 	UseRSyslogDetection bool
-	LastMonth        string
-	LastYear         int
-	RSyslogInfo      *RSyslogInfo
-	CompiledPatterns []struct {
-		Pattern     *regexp.Regexp
-		Type        string
-		Description string
-	}
+	RSyslogInfo        *RSyslogInfo
+	CompiledPatterns   []PatternInfo
 }
 
 func NewLogParser(currentYear int, verbose, useRSyslogDetection bool) *LogParser {
 	parser := &LogParser{
-		CurrentYear:      currentYear,
-		Verbose:          verbose,
+		CurrentYear:        currentYear,
+		Verbose:            verbose,
 		UseRSyslogDetection: useRSyslogDetection,
-		LastYear:         currentYear,
 	}
 
 	if useRSyslogDetection {
@@ -497,20 +468,12 @@ func NewLogParser(currentYear int, verbose, useRSyslogDetection bool) *LogParser
 	return parser
 }
 
-func (l *LogParser) compilePatterns() []struct {
-	Pattern     *regexp.Regexp
-	Type        string
-	Description string
-} {
+func (l *LogParser) compilePatterns() []PatternInfo {
 	if l.RSyslogInfo != nil {
 		return l.RSyslogInfo.GetRecommendedPatterns()
 	}
 
-	return []struct {
-		Pattern     *regexp.Regexp
-		Type        string
-		Description string
-	}{
+	return []PatternInfo{
 		{
 			Pattern: regexp.MustCompile(
 				`^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+` +
@@ -538,38 +501,6 @@ func (l *LogParser) compilePatterns() []struct {
 			Description: "ISO 8601 timestamp format",
 		},
 	}
-}
-
-func (l *LogParser) adjustYearBasedOnMonth(month string) int {
-	if l.LastMonth == "" {
-		l.LastMonth = month
-		return l.CurrentYear
-	}
-
-	monthNum := map[string]int{
-		"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-		"Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
-	}
-
-	currentMonthNum := monthNum[l.LastMonth]
-	newMonthNum := monthNum[month]
-
-	if currentMonthNum == 0 || newMonthNum == 0 {
-		return l.LastYear
-	}
-
-	var year int
-	if currentMonthNum == 12 && newMonthNum == 1 {
-		year = l.LastYear + 1
-	} else if currentMonthNum == 1 && newMonthNum == 12 {
-		year = l.LastYear - 1
-	} else {
-		year = l.LastYear
-	}
-
-	l.LastMonth = month
-	l.LastYear = year
-	return year
 }
 
 func (l *LogParser) parseIsoTimestamp(tsStr string) *time.Time {
@@ -610,7 +541,7 @@ func (l *LogParser) ParseLine(line string, now, cutoffDate time.Time) *LogEntry 
 			}
 		}
 
-		timestamp := l.extractTimestamp(groupDict, patternInfo.Type)
+		timestamp := l.extractTimestamp(groupDict, patternInfo.Type, now)
 		if timestamp == nil || timestamp.Before(cutoffDate) || timestamp.After(now.Add(24*time.Hour)) {
 			return nil
 		}
@@ -644,7 +575,7 @@ func (l *LogParser) isLikelyLogLine(line string) bool {
 	return regexp.MustCompile(`^\d{4}-\d{2}-\d{2}`).MatchString(line)
 }
 
-func (l *LogParser) extractTimestamp(groupDict map[string]string, patternType string) *time.Time {
+func (l *LogParser) extractTimestamp(groupDict map[string]string, patternType string, now time.Time) *time.Time {
 	if patternType == "iso8601" || patternType == "journald" || patternType == "rainerscript_enhanced" {
 		return l.parseIsoTimestamp(groupDict["timestamp"])
 	}
@@ -653,7 +584,15 @@ func (l *LogParser) extractTimestamp(groupDict map[string]string, patternType st
 	day := groupDict["day"]
 	timeStr := groupDict["time"]
 
-	year := l.adjustYearBasedOnMonth(month)
+	year := now.Year()
+	if monthNum, exists := map[string]int{
+		"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+		"Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+	}[month]; exists {
+		if monthNum > int(now.Month()) {
+			year--
+		}
+	}
 
 	var baseTime string
 	var microseconds int
@@ -681,15 +620,18 @@ func (l *LogParser) extractTimestamp(groupDict map[string]string, patternType st
 }
 
 func (l *LogParser) GetParserInfo() map[string]interface{} {
-	info := map[string]interface{}{
-		"patterns_loaded":     len(l.CompiledPatterns),
-		"pattern_types":       make([]string, len(l.CompiledPatterns)),
-		"pattern_descriptions": make([]string, len(l.CompiledPatterns)),
-	}
+	patternTypes := make([]string, len(l.CompiledPatterns))
+	patternDescriptions := make([]string, len(l.CompiledPatterns))
 
 	for i, pattern := range l.CompiledPatterns {
-		info["pattern_types"].([]string)[i] = pattern.Type
-		info["pattern_descriptions"].([]string)[i] = pattern.Description
+		patternTypes[i] = pattern.Type
+		patternDescriptions[i] = pattern.Description
+	}
+
+	info := map[string]interface{}{
+		"patterns_loaded":      len(l.CompiledPatterns),
+		"pattern_types":        patternTypes,
+		"pattern_descriptions": patternDescriptions,
 	}
 
 	if l.RSyslogInfo != nil {
@@ -878,66 +820,46 @@ func (r *RSyslogAnalyzer) openLogFile(filePath string) (io.ReadCloser, error) {
 	return file, nil
 }
 
-func (r *RSyslogAnalyzer) StreamLogs() <-chan *LogEntry {
-	ch := make(chan *LogEntry, 100)
-
-	go func() {
-		defer close(ch)
-
-		if r.LogFile == "" {
-			return
-		}
-
-		now := time.Now()
-		cutoffDate := now.AddDate(0, 0, -r.Config.MaxDays)
-
-		reader, err := r.openLogFile(r.LogFile)
-		if err != nil {
-			log.Printf("Cannot read log file: %v", err)
-			return
-		}
-		defer reader.Close()
-
-		scanner := bufio.NewScanner(reader)
-		for scanner.Scan() {
-			line := scanner.Text()
-			entry := r.Parser.ParseLine(strings.TrimSpace(line), now, cutoffDate)
-			if entry != nil {
-				ch <- entry
-			}
-		}
-
-		if err := scanner.Err(); err != nil && r.Config.Verbose {
-			log.Printf("Scanner error: %v", err)
-		}
-	}()
-
-	return ch
-}
-
-func (r *RSyslogAnalyzer) LoadLogs() {
+func (r *RSyslogAnalyzer) LoadLogs() error {
 	if r.LogFile == "" {
-		log.Printf("No log file specified or found")
-		return
+		return fmt.Errorf("no log file specified or found")
 	}
 
 	if _, err := os.Stat(r.LogFile); err != nil {
-		log.Printf("Log file does not exist: %s", r.LogFile)
-		return
+		return fmt.Errorf("log file does not exist: %s", r.LogFile)
 	}
 
 	info, err := os.Stat(r.LogFile)
 	if err != nil {
-		log.Printf("Cannot access log file: %v", err)
-		return
+		return fmt.Errorf("cannot access log file: %v", err)
 	}
 
 	if info.Size() > 1024*1024 {
 		fmt.Print("Parsing logs...")
+		defer fmt.Println(" done")
 	}
 
-	for entry := range r.StreamLogs() {
-		r.processEntry(entry)
+	reader, err := r.openLogFile(r.LogFile)
+	if err != nil {
+		return fmt.Errorf("cannot read log file: %v", err)
+	}
+	defer reader.Close()
+
+	now := time.Now()
+	cutoffDate := now.AddDate(0, 0, -r.Config.MaxDays)
+
+	scanner := bufio.NewScanner(reader)
+	for scanner.Scan() {
+		r.ProcessedLines++
+		line := scanner.Text()
+		entry := r.Parser.ParseLine(strings.TrimSpace(line), now, cutoffDate)
+		if entry != nil {
+			r.processEntry(entry)
+		}
+	}
+
+	if err := scanner.Err(); err != nil && r.Config.Verbose {
+		log.Printf("Scanner error: %v", err)
 	}
 
 	if r.Config.Verbose {
@@ -948,9 +870,7 @@ func (r *RSyslogAnalyzer) LoadLogs() {
 		log.Printf("Processed %d lines, parsed %d entries (%.1f%% success rate)", r.ProcessedLines, r.ParsedEntries, successRate)
 	}
 
-	if info.Size() > 1024*1024 {
-		fmt.Println(" done")
-	}
+	return nil
 }
 
 func (r *RSyslogAnalyzer) processEntry(entry *LogEntry) {
@@ -1086,7 +1006,7 @@ func (r *RSyslogAnalyzer) DisplayTree() {
 	for _, date := range dates {
 		fmt.Printf("\n%s\n", date)
 		services := r.Tree[date]
-		
+
 		serviceNames := make([]string, 0, len(services))
 		for service := range services {
 			serviceNames = append(serviceNames, service)
@@ -1162,6 +1082,37 @@ func (r *RSyslogAnalyzer) displayServiceLogs(logs []*LogEntry, isLastService boo
 	}
 }
 
+func wrapText(text string, width int) []string {
+	if len(text) <= width {
+		return []string{text}
+	}
+
+	lines := []string{}
+	currentLine := ""
+	words := strings.Fields(text)
+
+	for _, word := range words {
+		if len(currentLine)+len(word)+1 <= width {
+			if currentLine != "" {
+				currentLine += " " + word
+			} else {
+				currentLine = word
+			}
+		} else {
+			if currentLine != "" {
+				lines = append(lines, currentLine)
+			}
+			currentLine = word
+		}
+	}
+
+	if currentLine != "" {
+		lines = append(lines, currentLine)
+	}
+
+	return lines
+}
+
 func (r *RSyslogAnalyzer) displayLogEntry(log *LogEntry, prefix string, isLast bool) {
 	timestamp := log.Timestamp.Format("15:04:05")
 	levelIndicator := ""
@@ -1203,37 +1154,6 @@ func (r *RSyslogAnalyzer) displayLogEntry(log *LogEntry, prefix string, isLast b
 			fmt.Printf("│   %s%s\n", connector, line)
 		}
 	}
-}
-
-func wrapText(text string, width int) []string {
-	if len(text) <= width {
-		return []string{text}
-	}
-
-	lines := []string{}
-	currentLine := ""
-	words := strings.Fields(text)
-
-	for _, word := range words {
-		if len(currentLine)+len(word)+1 <= width {
-			if currentLine != "" {
-				currentLine += " " + word
-			} else {
-				currentLine = word
-			}
-		} else {
-			if currentLine != "" {
-				lines = append(lines, currentLine)
-			}
-			currentLine = word
-		}
-	}
-
-	if currentLine != "" {
-		lines = append(lines, currentLine)
-	}
-
-	return lines
 }
 
 func (r *RSyslogAnalyzer) getStyleForLog(log *LogEntry) string {
@@ -1411,8 +1331,8 @@ func (r *RSyslogAnalyzer) ExportToJSON(filename string) error {
 			"days_with_logs":  len(r.Tree),
 			"error_count":     r.AnalysisResults.ErrorCount,
 		},
-		"service_stats":      r.AnalysisResults.ServiceCounts,
-		"level_stats":        r.AnalysisResults.LevelDistribution,
+		"service_stats":       r.AnalysisResults.ServiceCounts,
+		"level_stats":         r.AnalysisResults.LevelDistribution,
 		"hourly_distribution": r.AnalysisResults.HourlyDistribution,
 	}
 
@@ -1586,7 +1506,9 @@ func main() {
 		return
 	}
 
-	analyzer.LoadLogs()
+	if err := analyzer.LoadLogs(); err != nil {
+		log.Fatalf("Failed to load logs: %v", err)
+	}
 	analyzer.BuildTree()
 
 	if *findErrors {
