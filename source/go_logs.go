@@ -4,13 +4,13 @@ import (
 	"bufio"
 	"compress/bzip2"
 	"compress/gzip"
+	"context"
 	"encoding/csv"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +20,17 @@ import (
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	RecentDaysCount     = 7
+	DefaultMaxFileSize  = 100 * 1024 * 1024
+	MaxDisplayErrors    = 10
+	MaxDisplayFiltered  = 20
+	MaxErrorPatterns    = 10
+	MaxTopServices      = 5
+	MaxPointerJumps     = 20
+	MaxPatternTypes     = 10
 )
 
 var (
@@ -40,6 +51,8 @@ var (
 		"Jul": time.July,    "Aug": time.August,   "Sep": time.September,
 		"Oct": time.October, "Nov": time.November, "Dec": time.December,
 	}
+
+	ALLOWED_DIRS = []string{"/var/log", "/tmp/logs", "/opt/logs"}
 )
 
 type SecurityError struct {
@@ -292,12 +305,34 @@ func NewDefaultConfig() *AnalyzerConfig {
 	}
 }
 
+func (c *AnalyzerConfig) Validate() error {
+	if c.MaxDays <= 0 {
+		return fmt.Errorf("MaxDays must be positive")
+	}
+	if c.MaxFileSizeMB <= 0 {
+		return fmt.Errorf("MaxFileSizeMB must be positive")
+	}
+	if c.MaxMemoryEntries <= 0 {
+		return fmt.Errorf("MaxMemoryEntries must be positive")
+	}
+	if c.TruncateLength <= 0 {
+		return fmt.Errorf("TruncateLength must be positive")
+	}
+	if c.MaxLinesPerService <= 0 {
+		return fmt.Errorf("MaxLinesPerService must be positive")
+	}
+	return nil
+}
+
 func (c *AnalyzerConfig) FromFile(configPath string) error {
 	content, err := os.ReadFile(configPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read config file: %w", err)
 	}
-	return json.Unmarshal(content, c)
+	if err := json.Unmarshal(content, c); err != nil {
+		return fmt.Errorf("failed to parse config JSON: %w", err)
+	}
+	return c.Validate()
 }
 
 type LogEntry struct {
@@ -422,7 +457,7 @@ func (e *ErrorClusterPlugin) GetResults() map[string]interface{} {
 		return e.ErrorPatterns[patterns[i]] > e.ErrorPatterns[patterns[j]]
 	})
 	for i, pattern := range patterns {
-		if i >= 10 {
+		if i >= MaxErrorPatterns {
 			break
 		}
 		topPatterns[pattern] = e.ErrorPatterns[pattern]
@@ -442,25 +477,108 @@ func (e *ErrorClusterPlugin) GetResults() map[string]interface{} {
 	}
 }
 
+type BoundedLogStorage struct {
+	entries []*LogEntry
+	maxSize int
+	mu      sync.RWMutex
+}
+
+func NewBoundedLogStorage(maxSize int) *BoundedLogStorage {
+	return &BoundedLogStorage{
+		entries: make([]*LogEntry, 0, maxSize),
+		maxSize: maxSize,
+	}
+}
+
+func (b *BoundedLogStorage) Add(entry *LogEntry) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(b.entries) >= b.maxSize {
+		b.entries = b.entries[1:]
+	}
+	b.entries = append(b.entries, entry)
+}
+
+func (b *BoundedLogStorage) GetAll() []*LogEntry {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	result := make([]*LogEntry, len(b.entries))
+	copy(result, b.entries)
+	return result
+}
+
+type ConcurrentTree struct {
+	mu   sync.RWMutex
+	tree map[string]map[string][]*LogEntry
+}
+
+func NewConcurrentTree() *ConcurrentTree {
+	return &ConcurrentTree{
+		tree: make(map[string]map[string][]*LogEntry),
+	}
+}
+
+func (c *ConcurrentTree) AddEntry(date, service string, entry *LogEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tree[date] == nil {
+		c.tree[date] = make(map[string][]*LogEntry)
+	}
+	c.tree[date][service] = append(c.tree[date][service], entry)
+}
+
+func (c *ConcurrentTree) GetTree() map[string]map[string][]*LogEntry {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make(map[string]map[string][]*LogEntry)
+	for date, services := range c.tree {
+		result[date] = make(map[string][]*LogEntry)
+		for service, entries := range services {
+			result[date][service] = append([]*LogEntry{}, entries...)
+		}
+	}
+	return result
+}
+
+func (c *ConcurrentTree) GetDates() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	dates := make([]string, 0, len(c.tree))
+	for date := range c.tree {
+		dates = append(dates, date)
+	}
+	return dates
+}
+
+type xzReader struct {
+	io.Reader
+	cmd *exec.Cmd
+}
+
+func (x *xzReader) Close() error {
+	return x.cmd.Wait()
+}
+
 type LogParser struct {
-	CurrentYear        int
-	Verbose            bool
+	CurrentYear         int
+	Verbose             bool
 	UseRSyslogDetection bool
-	RSyslogInfo        *RSyslogInfo
-	CompiledPatterns   []PatternInfo
+	RSyslogInfo         *RSyslogInfo
+	CompiledPatterns    []PatternInfo
 }
 
 func NewLogParser(currentYear int, verbose, useRSyslogDetection bool) *LogParser {
 	parser := &LogParser{
-		CurrentYear:        currentYear,
-		Verbose:            verbose,
+		CurrentYear:         currentYear,
+		Verbose:             verbose,
 		UseRSyslogDetection: useRSyslogDetection,
 	}
 
 	if useRSyslogDetection {
 		parser.RSyslogInfo = &RSyslogInfo{}
 		if parser.RSyslogInfo.DetectRSyslogInfo() && verbose {
-			log.Printf("Detected rsyslogd version: %s", parser.RSyslogInfo.Version)
+			slog.Info("detected rsyslogd version", "version", parser.RSyslogInfo.Version)
 		}
 	}
 
@@ -647,7 +765,7 @@ func (l *LogParser) GetParserInfo() map[string]interface{} {
 }
 
 type RSyslogAnalyzer struct {
-	Tree            map[string]map[string][]*LogEntry
+	Tree            *ConcurrentTree
 	Config          *AnalyzerConfig
 	LogFile         string
 	CurrentYear     int
@@ -657,7 +775,7 @@ type RSyslogAnalyzer struct {
 	ProcessedLines  int
 	ParsedEntries   int
 	MemoryWarning   bool
-	mu              sync.RWMutex
+	storage         *BoundedLogStorage
 }
 
 func NewRSyslogAnalyzer(logFile string, config *AnalyzerConfig) *RSyslogAnalyzer {
@@ -667,13 +785,14 @@ func NewRSyslogAnalyzer(logFile string, config *AnalyzerConfig) *RSyslogAnalyzer
 
 	currentYear := time.Now().Year()
 	analyzer := &RSyslogAnalyzer{
-		Tree:            make(map[string]map[string][]*LogEntry),
+		Tree:            NewConcurrentTree(),
 		Config:          config,
 		LogFile:         logFile,
 		CurrentYear:     currentYear,
 		Parser:          NewLogParser(currentYear, config.Verbose, config.UseRSyslogDetection),
 		AnalysisResults: NewAnalysisResults(),
 		Plugins:         []AnalysisPlugin{NewErrorClusterPlugin()},
+		storage:         NewBoundedLogStorage(config.MaxMemoryEntries),
 	}
 
 	if analyzer.LogFile == "" {
@@ -692,8 +811,8 @@ func (r *RSyslogAnalyzer) isReadableLog(path string) bool {
 }
 
 func (r *RSyslogAnalyzer) getRecentDates() []string {
-	dates := make([]string, 7)
-	for i := 0; i < 7; i++ {
+	dates := make([]string, RecentDaysCount)
+	for i := 0; i < RecentDaysCount; i++ {
 		date := time.Now().AddDate(0, 0, -i).Format("20060102")
 		dates[i] = date
 	}
@@ -751,7 +870,7 @@ func (r *RSyslogAnalyzer) findLogFile() string {
 	}
 
 	if len(candidates) == 0 {
-		log.Printf("No standard syslog file found or insufficient permissions.")
+		slog.Warn("no standard syslog file found or insufficient permissions")
 		return ""
 	}
 
@@ -760,7 +879,7 @@ func (r *RSyslogAnalyzer) findLogFile() string {
 	})
 
 	selected := candidates[0].Path
-	log.Printf("Using log file: %s", selected)
+	slog.Info("using log file", "path", selected)
 	return selected
 }
 
@@ -769,10 +888,16 @@ func (r *RSyslogAnalyzer) isSafePath(path string) bool {
 	if err != nil {
 		return false
 	}
-	allowedDirs := []string{"/var/log", "/tmp/logs", "/opt/logs"}
-	for _, allowed := range allowedDirs {
+
+	resolved = filepath.Clean(resolved)
+
+	for _, allowed := range ALLOWED_DIRS {
+		allowed = filepath.Clean(allowed)
 		if strings.HasPrefix(resolved, allowed) {
-			return true
+			rel, err := filepath.Rel(allowed, resolved)
+			if err == nil && !strings.Contains(rel, "..") {
+				return true
+			}
 		}
 	}
 	return false
@@ -781,30 +906,35 @@ func (r *RSyslogAnalyzer) isSafePath(path string) bool {
 func (r *RSyslogAnalyzer) openLogFile(filePath string) (io.ReadCloser, error) {
 	resolvedPath, err := filepath.EvalSymlinks(filePath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to resolve symlinks: %w", err)
 	}
 
 	if !r.isSafePath(resolvedPath) {
-		return nil, SecurityError{Message: fmt.Sprintf("Access to %s not allowed", filePath)}
+		return nil, SecurityError{Message: fmt.Sprintf("access to %s not allowed", filePath)}
 	}
 
 	info, err := os.Stat(resolvedPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to stat file: %w", err)
 	}
 
 	fileSizeMB := info.Size() / (1024 * 1024)
 	if fileSizeMB > int64(r.Config.MaxFileSizeMB) {
-		return nil, SecurityError{Message: fmt.Sprintf("File too large: %dMB > %dMB limit", fileSizeMB, r.Config.MaxFileSizeMB)}
+		return nil, SecurityError{Message: fmt.Sprintf("file too large: %dMB > %dMB limit", fileSizeMB, r.Config.MaxFileSizeMB)}
 	}
 
 	file, err := os.Open(resolvedPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
 
 	if strings.HasSuffix(filePath, ".gz") {
-		return gzip.NewReader(file)
+		reader, err := gzip.NewReader(file)
+		if err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		return reader, nil
 	} else if strings.HasSuffix(filePath, ".bz2") {
 		return struct {
 			io.Reader
@@ -814,13 +944,27 @@ func (r *RSyslogAnalyzer) openLogFile(filePath string) (io.ReadCloser, error) {
 			Closer: file,
 		}, nil
 	} else if strings.HasSuffix(filePath, ".xz") {
-		return file, errors.New("xz compression not supported in standard library")
+		cmd := exec.Command("xz", "-dc", resolvedPath)
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			file.Close()
+			return nil, fmt.Errorf("xz compression not supported and system xz command unavailable: %w", err)
+		}
+		if err := cmd.Start(); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to start xz command: %w", err)
+		}
+		return &xzReader{stdout, cmd}, nil
 	}
 
 	return file, nil
 }
 
 func (r *RSyslogAnalyzer) LoadLogs() error {
+	return r.LoadLogsWithContext(context.Background())
+}
+
+func (r *RSyslogAnalyzer) LoadLogsWithContext(ctx context.Context) error {
 	if r.LogFile == "" {
 		return fmt.Errorf("no log file specified or found")
 	}
@@ -831,7 +975,7 @@ func (r *RSyslogAnalyzer) LoadLogs() error {
 
 	info, err := os.Stat(r.LogFile)
 	if err != nil {
-		return fmt.Errorf("cannot access log file: %v", err)
+		return fmt.Errorf("cannot access log file: %w", err)
 	}
 
 	if info.Size() > 1024*1024 {
@@ -841,7 +985,7 @@ func (r *RSyslogAnalyzer) LoadLogs() error {
 
 	reader, err := r.openLogFile(r.LogFile)
 	if err != nil {
-		return fmt.Errorf("cannot read log file: %v", err)
+		return fmt.Errorf("cannot read log file: %w", err)
 	}
 	defer reader.Close()
 
@@ -850,6 +994,12 @@ func (r *RSyslogAnalyzer) LoadLogs() error {
 
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		r.ProcessedLines++
 		line := scanner.Text()
 		entry := r.Parser.ParseLine(strings.TrimSpace(line), now, cutoffDate)
@@ -859,7 +1009,7 @@ func (r *RSyslogAnalyzer) LoadLogs() error {
 	}
 
 	if err := scanner.Err(); err != nil && r.Config.Verbose {
-		log.Printf("Scanner error: %v", err)
+		slog.Warn("scanner error", "error", err)
 	}
 
 	if r.Config.Verbose {
@@ -867,19 +1017,19 @@ func (r *RSyslogAnalyzer) LoadLogs() error {
 		if r.ProcessedLines > 0 {
 			successRate = float64(r.ParsedEntries) / float64(r.ProcessedLines) * 100
 		}
-		log.Printf("Processed %d lines, parsed %d entries (%.1f%% success rate)", r.ProcessedLines, r.ParsedEntries, successRate)
+		slog.Info("processing complete",
+			"processed_lines", r.ProcessedLines,
+			"parsed_entries", r.ParsedEntries,
+			"success_rate", successRate)
 	}
 
 	return nil
 }
 
 func (r *RSyslogAnalyzer) processEntry(entry *LogEntry) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if r.ParsedEntries >= r.Config.MaxMemoryEntries {
 		if !r.MemoryWarning {
-			log.Printf("Memory limit reached (%d entries). Stopping processing.", r.Config.MaxMemoryEntries)
+			slog.Warn("memory limit reached", "limit", r.Config.MaxMemoryEntries)
 			r.MemoryWarning = true
 		}
 		return
@@ -887,10 +1037,8 @@ func (r *RSyslogAnalyzer) processEntry(entry *LogEntry) {
 
 	r.ParsedEntries++
 	dateKey := entry.Timestamp.Format("2006-01-02")
-	if r.Tree[dateKey] == nil {
-		r.Tree[dateKey] = make(map[string][]*LogEntry)
-	}
-	r.Tree[dateKey][entry.Service] = append(r.Tree[dateKey][entry.Service], entry)
+	r.Tree.AddEntry(dateKey, entry.Service, entry)
+	r.storage.Add(entry)
 
 	if r.Config.EnableAnalysis {
 		r.AnalysisResults.Update(entry)
@@ -902,10 +1050,9 @@ func (r *RSyslogAnalyzer) processEntry(entry *LogEntry) {
 }
 
 func (r *RSyslogAnalyzer) BuildTree() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	tree := r.Tree.GetTree()
 
-	for _, services := range r.Tree {
+	for _, services := range tree {
 		for _, logs := range services {
 			sort.Slice(logs, func(i, j int) bool {
 				return logs[i].Timestamp.Before(logs[j].Timestamp)
@@ -913,11 +1060,8 @@ func (r *RSyslogAnalyzer) BuildTree() {
 		}
 	}
 
-	if len(r.Tree) > 0 && r.Config.EnableAnalysis {
-		dates := make([]string, 0, len(r.Tree))
-		for date := range r.Tree {
-			dates = append(dates, date)
-		}
+	if len(tree) > 0 && r.Config.EnableAnalysis {
+		dates := r.Tree.GetDates()
 		sort.Strings(dates)
 		r.AnalysisResults.DateRange = [2]string{dates[0], dates[len(dates)-1]}
 	}
@@ -982,10 +1126,9 @@ func (r *RSyslogAnalyzer) displayTextSystemInfo(parserInfo map[string]interface{
 }
 
 func (r *RSyslogAnalyzer) DisplayTree() {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	tree := r.Tree.GetTree()
 
-	if len(r.Tree) == 0 {
+	if len(tree) == 0 {
 		fmt.Println("No logs to display.")
 		return
 	}
@@ -997,15 +1140,12 @@ func (r *RSyslogAnalyzer) DisplayTree() {
 		fmt.Println(strings.Repeat("=", 50))
 	}
 
-	dates := make([]string, 0, len(r.Tree))
-	for date := range r.Tree {
-		dates = append(dates, date)
-	}
+	dates := r.Tree.GetDates()
 	sort.Strings(dates)
 
 	for _, date := range dates {
 		fmt.Printf("\n%s\n", date)
-		services := r.Tree[date]
+		services := tree[date]
 
 		serviceNames := make([]string, 0, len(services))
 		for service := range services {
@@ -1194,10 +1334,7 @@ func (r *RSyslogAnalyzer) printLine(text, style string) {
 }
 
 func (r *RSyslogAnalyzer) DisplaySummary() {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	if len(r.Tree) == 0 {
+	if r.AnalysisResults.TotalEntries == 0 {
 		fmt.Println("No logs found.")
 		return
 	}
@@ -1214,7 +1351,7 @@ func (r *RSyslogAnalyzer) displayColorSummary() {
 	fmt.Printf("Total entries: %d\n", r.AnalysisResults.TotalEntries)
 	fmt.Printf("Unique services: %d\n", len(r.AnalysisResults.UniqueServices))
 	fmt.Printf("Date range: %s to %s\n", r.AnalysisResults.DateRange[0], r.AnalysisResults.DateRange[1])
-	fmt.Printf("Days with logs: %d\n", len(r.Tree))
+	fmt.Printf("Days with logs: %d\n", len(r.Tree.GetDates()))
 	fmt.Printf("Error count: %d\n", r.AnalysisResults.ErrorCount)
 
 	topServices := make([]struct {
@@ -1230,8 +1367,8 @@ func (r *RSyslogAnalyzer) displayColorSummary() {
 	sort.Slice(topServices, func(i, j int) bool {
 		return topServices[i].Count > topServices[j].Count
 	})
-	if len(topServices) > 5 {
-		topServices = topServices[:5]
+	if len(topServices) > MaxTopServices {
+		topServices = topServices[:MaxTopServices]
 	}
 	servicesStr := ""
 	for i, s := range topServices {
@@ -1278,7 +1415,7 @@ func (r *RSyslogAnalyzer) displayTextSummary() {
 	fmt.Printf("  Total entries: %d\n", r.AnalysisResults.TotalEntries)
 	fmt.Printf("  Unique services: %d\n", len(r.AnalysisResults.UniqueServices))
 	fmt.Printf("  Date range: %s to %s\n", r.AnalysisResults.DateRange[0], r.AnalysisResults.DateRange[1])
-	fmt.Printf("  Days with logs: %d\n", len(r.Tree))
+	fmt.Printf("  Days with logs: %d\n", len(r.Tree.GetDates()))
 	fmt.Printf("  Error count: %d\n", r.AnalysisResults.ErrorCount)
 
 	topServices := make([]struct {
@@ -1294,8 +1431,8 @@ func (r *RSyslogAnalyzer) displayTextSummary() {
 	sort.Slice(topServices, func(i, j int) bool {
 		return topServices[i].Count > topServices[j].Count
 	})
-	if len(topServices) > 5 {
-		topServices = topServices[:5]
+	if len(topServices) > MaxTopServices {
+		topServices = topServices[:MaxTopServices]
 	}
 	servicesStr := ""
 	for i, s := range topServices {
@@ -1328,7 +1465,7 @@ func (r *RSyslogAnalyzer) ExportToJSON(filename string) error {
 			"total_entries":   r.AnalysisResults.TotalEntries,
 			"unique_services": len(r.AnalysisResults.UniqueServices),
 			"date_range":      r.AnalysisResults.DateRange,
-			"days_with_logs":  len(r.Tree),
+			"days_with_logs":  len(r.Tree.GetDates()),
 			"error_count":     r.AnalysisResults.ErrorCount,
 		},
 		"service_stats":       r.AnalysisResults.ServiceCounts,
@@ -1344,16 +1481,20 @@ func (r *RSyslogAnalyzer) ExportToJSON(filename string) error {
 
 	content, err := json.MarshalIndent(exportData, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to marshal JSON: %w", err)
 	}
 
-	return os.WriteFile(filename, content, 0644)
+	if err := os.WriteFile(filename, content, 0644); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	return nil
 }
 
 func (r *RSyslogAnalyzer) ExportToCSV(filename string) error {
 	file, err := os.Create(filename)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create file: %w", err)
 	}
 	defer file.Close()
 
@@ -1361,26 +1502,21 @@ func (r *RSyslogAnalyzer) ExportToCSV(filename string) error {
 	defer writer.Flush()
 
 	if err := writer.Write([]string{"Timestamp", "Service", "Level", "Host", "PID", "Message"}); err != nil {
-		return err
+		return fmt.Errorf("failed to write header: %w", err)
 	}
 
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	entries := r.storage.GetAll()
 
-	for _, dateServices := range r.Tree {
-		for _, logs := range dateServices {
-			for _, log := range logs {
-				if err := writer.Write([]string{
-					log.Timestamp.Format(time.RFC3339),
-					log.Service,
-					log.Level,
-					log.Host,
-					log.PID,
-					log.Message,
-				}); err != nil {
-					return err
-				}
-			}
+	for _, log := range entries {
+		if err := writer.Write([]string{
+			log.Timestamp.Format(time.RFC3339),
+			log.Service,
+			log.Level,
+			log.Host,
+			log.PID,
+			log.Message,
+		}); err != nil {
+			return fmt.Errorf("failed to write row: %w", err)
 		}
 	}
 
@@ -1388,20 +1524,15 @@ func (r *RSyslogAnalyzer) ExportToCSV(filename string) error {
 }
 
 func (r *RSyslogAnalyzer) FindErrors(service string) []*LogEntry {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
+	entries := r.storage.GetAll()
 	errors := make([]*LogEntry, 0)
-	for _, dateServices := range r.Tree {
-		for svc, logs := range dateServices {
-			if service != "" && svc != service {
-				continue
-			}
-			for _, log := range logs {
-				if log.IsError() {
-					errors = append(errors, log)
-				}
-			}
+
+	for _, log := range entries {
+		if service != "" && log.Service != service {
+			continue
+		}
+		if log.IsError() {
+			errors = append(errors, log)
 		}
 	}
 
@@ -1413,30 +1544,29 @@ func (r *RSyslogAnalyzer) FindErrors(service string) []*LogEntry {
 }
 
 func (r *RSyslogAnalyzer) FilterLogs(servicePattern, level, messageContains string) []*LogEntry {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
+	entries := r.storage.GetAll()
 	filtered := make([]*LogEntry, 0)
 	var serviceRegex *regexp.Regexp
 	if servicePattern != "" {
-		serviceRegex = regexp.MustCompile(servicePattern)
+		var err error
+		serviceRegex, err = regexp.Compile(servicePattern)
+		if err != nil {
+			slog.Warn("invalid service pattern regex", "pattern", servicePattern, "error", err)
+			return filtered
+		}
 	}
 
-	for _, dateServices := range r.Tree {
-		for service, logs := range dateServices {
-			if serviceRegex != nil && !serviceRegex.MatchString(service) {
-				continue
-			}
-			for _, log := range logs {
-				if level != "" && log.Level != level {
-					continue
-				}
-				if messageContains != "" && !strings.Contains(strings.ToLower(log.Message), strings.ToLower(messageContains)) {
-					continue
-				}
-				filtered = append(filtered, log)
-			}
+	for _, log := range entries {
+		if serviceRegex != nil && !serviceRegex.MatchString(log.Service) {
+			continue
 		}
+		if level != "" && log.Level != level {
+			continue
+		}
+		if messageContains != "" && !strings.Contains(strings.ToLower(log.Message), strings.ToLower(messageContains)) {
+			continue
+		}
+		filtered = append(filtered, log)
 	}
 
 	sort.Slice(filtered, func(i, j int) bool {
@@ -1475,6 +1605,9 @@ func main() {
 
 	flag.Parse()
 
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	slog.SetDefault(logger)
+
 	if *showVersion {
 		fmt.Println("RSyslogAnalyzer 4.0.0")
 		return
@@ -1483,7 +1616,8 @@ func main() {
 	config := NewDefaultConfig()
 	if *configFile != "" {
 		if err := config.FromFile(*configFile); err != nil {
-			log.Printf("Error loading config file: %v", err)
+			slog.Error("error loading config file", "error", err)
+			os.Exit(1)
 		}
 	} else {
 		config.MaxDays = *maxDays
@@ -1499,6 +1633,16 @@ func main() {
 		config.UseRSyslogDetection = !*noRSyslogDetection
 	}
 
+	if err := config.Validate(); err != nil {
+		slog.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
+
+	slog.Info("starting log analysis",
+		"logFile", *logFile,
+		"maxDays", *maxDays,
+		"maxMemoryEntries", *maxMemoryEntries)
+
 	analyzer := NewRSyslogAnalyzer(*logFile, config)
 
 	if *systemInfo {
@@ -1506,8 +1650,12 @@ func main() {
 		return
 	}
 
-	if err := analyzer.LoadLogs(); err != nil {
-		log.Fatalf("Failed to load logs: %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := analyzer.LoadLogsWithContext(ctx); err != nil {
+		slog.Error("failed to load logs", "error", err)
+		os.Exit(1)
 	}
 	analyzer.BuildTree()
 
@@ -1516,8 +1664,8 @@ func main() {
 		if len(errors) > 0 {
 			fmt.Printf("\nFound %d error logs:\n", len(errors))
 			displayCount := len(errors)
-			if displayCount > 10 {
-				displayCount = 10
+			if displayCount > MaxDisplayErrors {
+				displayCount = MaxDisplayErrors
 			}
 			for _, err := range errors[len(errors)-displayCount:] {
 				message := err.Message
@@ -1534,8 +1682,8 @@ func main() {
 		if len(filtered) > 0 {
 			fmt.Printf("\nFound %d matching logs:\n", len(filtered))
 			displayCount := len(filtered)
-			if displayCount > 20 {
-				displayCount = 20
+			if displayCount > MaxDisplayFiltered {
+				displayCount = MaxDisplayFiltered
 			}
 			for _, log := range filtered[len(filtered)-displayCount:] {
 				message := log.Message
@@ -1559,17 +1707,17 @@ func main() {
 
 	if *export != "" {
 		if err := analyzer.ExportToJSON(*export); err != nil {
-			log.Printf("Error exporting to JSON: %v", err)
+			slog.Error("error exporting to JSON", "error", err)
 		} else {
-			log.Printf("Exported analysis to %s", *export)
+			slog.Info("exported analysis to JSON", "file", *export)
 		}
 	}
 
 	if *exportCSV != "" {
 		if err := analyzer.ExportToCSV(*exportCSV); err != nil {
-			log.Printf("Error exporting to CSV: %v", err)
+			slog.Error("error exporting to CSV", "error", err)
 		} else {
-			log.Printf("Exported log data to %s", *exportCSV)
+			slog.Info("exported log data to CSV", "file", *exportCSV)
 		}
 	}
 }
