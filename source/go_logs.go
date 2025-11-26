@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -495,9 +496,10 @@ func (b *BoundedLogStorage) Add(entry *LogEntry) {
 	defer b.mu.Unlock()
 
 	if len(b.entries) >= b.maxSize {
-		b.entries = b.entries[1:]
+		b.entries = append(b.entries[1:], entry)
+	} else {
+		b.entries = append(b.entries, entry)
 	}
-	b.entries = append(b.entries, entry)
 }
 
 func (b *BoundedLogStorage) GetAll() []*LogEntry {
@@ -506,6 +508,12 @@ func (b *BoundedLogStorage) GetAll() []*LogEntry {
 	result := make([]*LogEntry, len(b.entries))
 	copy(result, b.entries)
 	return result
+}
+
+func (b *BoundedLogStorage) Size() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.entries)
 }
 
 type ConcurrentTree struct {
@@ -557,7 +565,10 @@ type xzReader struct {
 }
 
 func (x *xzReader) Close() error {
-	return x.cmd.Wait()
+	if err := x.cmd.Wait(); err != nil {
+		return fmt.Errorf("xz command failed: %w", err)
+	}
+	return nil
 }
 
 type LogParser struct {
@@ -772,8 +783,8 @@ type RSyslogAnalyzer struct {
 	Parser          *LogParser
 	AnalysisResults *AnalysisResults
 	Plugins         []AnalysisPlugin
-	ProcessedLines  int
-	ParsedEntries   int
+	ProcessedLines  int64
+	ParsedEntries   int64
 	MemoryWarning   bool
 	storage         *BoundedLogStorage
 }
@@ -993,6 +1004,9 @@ func (r *RSyslogAnalyzer) LoadLogsWithContext(ctx context.Context) error {
 	cutoffDate := now.AddDate(0, 0, -r.Config.MaxDays)
 
 	scanner := bufio.NewScanner(reader)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -1000,7 +1014,7 @@ func (r *RSyslogAnalyzer) LoadLogsWithContext(ctx context.Context) error {
 		default:
 		}
 
-		r.ProcessedLines++
+		atomic.AddInt64(&r.ProcessedLines, 1)
 		line := scanner.Text()
 		entry := r.Parser.ParseLine(strings.TrimSpace(line), now, cutoffDate)
 		if entry != nil {
@@ -1013,13 +1027,15 @@ func (r *RSyslogAnalyzer) LoadLogsWithContext(ctx context.Context) error {
 	}
 
 	if r.Config.Verbose {
+		processed := atomic.LoadInt64(&r.ProcessedLines)
+		parsed := atomic.LoadInt64(&r.ParsedEntries)
 		successRate := 0.0
-		if r.ProcessedLines > 0 {
-			successRate = float64(r.ParsedEntries) / float64(r.ProcessedLines) * 100
+		if processed > 0 {
+			successRate = float64(parsed) / float64(processed) * 100
 		}
 		slog.Info("processing complete",
-			"processed_lines", r.ProcessedLines,
-			"parsed_entries", r.ParsedEntries,
+			"processed_lines", processed,
+			"parsed_entries", parsed,
 			"success_rate", successRate)
 	}
 
@@ -1027,7 +1043,7 @@ func (r *RSyslogAnalyzer) LoadLogsWithContext(ctx context.Context) error {
 }
 
 func (r *RSyslogAnalyzer) processEntry(entry *LogEntry) {
-	if r.ParsedEntries >= r.Config.MaxMemoryEntries {
+	if r.storage.Size() >= r.Config.MaxMemoryEntries {
 		if !r.MemoryWarning {
 			slog.Warn("memory limit reached", "limit", r.Config.MaxMemoryEntries)
 			r.MemoryWarning = true
@@ -1035,7 +1051,7 @@ func (r *RSyslogAnalyzer) processEntry(entry *LogEntry) {
 		return
 	}
 
-	r.ParsedEntries++
+	atomic.AddInt64(&r.ParsedEntries, 1)
 	dateKey := entry.Timestamp.Format("2006-01-02")
 	r.Tree.AddEntry(dateKey, entry.Service, entry)
 	r.storage.Add(entry)
