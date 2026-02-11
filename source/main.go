@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
 	"context"
@@ -34,10 +35,13 @@ const (
 	MaxPointerJumps     = 20
 	MaxPatternTypes     = 10
 	MaxMonthDetection   = 12
+	MaxDecompressedSize = 100 * 1024 * 1024
+	MaxLineLength       = 10 * 1024 * 1024
+	CommandTimeout      = 5 * time.Second
 )
 
 var (
-	DEFAULT_SYSLOG_PATHS = []string{
+	defaultSyslogPaths = []string{
 		"/var/log/messages",
 		"/var/log/syslog",
 		"/var/log/system.log",
@@ -48,14 +52,14 @@ var (
 		"/var/log/debug",
 	}
 
-	MONTHS = map[string]time.Month{
+	months = map[string]time.Month{
 		"Jan": time.January, "Feb": time.February, "Mar": time.March,
 		"Apr": time.April,   "May": time.May,      "Jun": time.June,
 		"Jul": time.July,    "Aug": time.August,   "Sep": time.September,
 		"Oct": time.October, "Nov": time.November, "Dec": time.December,
 	}
 
-	ALLOWED_DIRS = []string{"/var/log", "/tmp/logs", "/opt/logs"}
+	allowedDirs = []string{"/var/log", "/tmp/logs", "/opt/logs", "/var/log/journal", "/run/log"}
 
 	regexPool = sync.Pool{
 		New: func() interface{} {
@@ -82,7 +86,10 @@ type RSyslogInfo struct {
 }
 
 func (r *RSyslogInfo) DetectRSyslogInfo() (bool, error) {
-	cmd := exec.Command("rsyslogd", "-v")
+	ctx, cancel := context.WithTimeout(context.Background(), CommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "rsyslogd", "-v")
 	output, err := cmd.CombinedOutput()
 	if err == nil {
 		return r.parseVersionOutput(string(output)), nil
@@ -136,7 +143,10 @@ func (r *RSyslogInfo) parseVersionOutput(output string) bool {
 }
 
 func (r *RSyslogInfo) detectFromSystem() (bool, error) {
-	cmd := exec.Command("pgrep", "rsyslog")
+	ctx, cancel := context.WithTimeout(context.Background(), CommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "pgrep", "rsyslog")
 	output, err := cmd.CombinedOutput()
 	if err == nil && len(output) > 0 {
 		r.Version = "unknown (running)"
@@ -383,7 +393,7 @@ type AnalysisResults struct {
 	ErrorCount         int
 	LevelDistribution  map[string]int
 	HourlyDistribution map[string]int
-	mu                 sync.RWMutex
+	mu                 sync.Mutex
 }
 
 func NewAnalysisResults() *AnalysisResults {
@@ -520,6 +530,7 @@ func (b *BoundedLogStorage) Add(entry *LogEntry) {
 	if b.size < b.maxSize {
 		b.size++
 	} else {
+		b.entries[b.head] = nil
 		b.head = (b.head + 1) % b.maxSize
 	}
 }
@@ -571,11 +582,14 @@ func (c *ConcurrentTree) AddEntry(date, service string, entry *LogEntry) {
 func (c *ConcurrentTree) GetTree() map[string]map[string][]*LogEntry {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
 	result := make(map[string]map[string][]*LogEntry)
 	for date, services := range c.tree {
 		result[date] = make(map[string][]*LogEntry)
 		for service, entries := range services {
-			result[date][service] = append([]*LogEntry{}, entries...)
+			entriesCopy := make([]*LogEntry, len(entries))
+			copy(entriesCopy, entries)
+			result[date][service] = entriesCopy
 		}
 	}
 	return result
@@ -597,10 +611,30 @@ type xzReader struct {
 }
 
 func (x *xzReader) Close() error {
+	if x.cmd.Process != nil {
+		x.cmd.Process.Kill()
+	}
 	if err := x.cmd.Wait(); err != nil {
 		return fmt.Errorf("xz command failed: %w", err)
 	}
 	return nil
+}
+
+func validateCompressedFile(original io.Reader, maxSize int64) (io.Reader, error) {
+	var buf bytes.Buffer
+	limitReader := io.LimitReader(original, maxSize+1)
+	tee := io.TeeReader(limitReader, &buf)
+
+	n, err := io.Copy(io.Discard, tee)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("validation read failed: %w", err)
+	}
+
+	if n > maxSize {
+		return nil, errors.New("file appears to be a decompression bomb")
+	}
+
+	return io.MultiReader(&buf, original), nil
 }
 
 type LogParser struct {
@@ -680,12 +714,15 @@ func (l *LogParser) parseIsoTimestamp(tsStr string) (*time.Time, error) {
 		"2006-01-02T15:04:05.999999-0700",
 	}
 
+	var lastErr error
 	for _, format := range formats {
 		if t, err := time.Parse(format, tsStr); err == nil {
 			return &t, nil
+		} else {
+			lastErr = err
 		}
 	}
-	return nil, fmt.Errorf("failed to parse timestamp: %s", tsStr)
+	return nil, fmt.Errorf("failed to parse timestamp %q: %w", tsStr, lastErr)
 }
 
 func (l *LogParser) ParseLine(line string, now, cutoffDate time.Time) (*LogEntry, error) {
@@ -740,7 +777,7 @@ func (l *LogParser) isLikelyLogLine(line string) bool {
 
 	if len(line) >= 3 {
 		firstThree := line[:3]
-		if _, exists := MONTHS[firstThree]; exists {
+		if _, exists := months[firstThree]; exists {
 			return true
 		}
 	}
@@ -902,7 +939,7 @@ func (r *RSyslogAnalyzer) findLogFile() string {
 		Mtime time.Time
 	}, 0)
 
-	for _, path := range DEFAULT_SYSLOG_PATHS {
+	for _, path := range defaultSyslogPaths {
 		if r.isReadableLog(path) {
 			if info, err := os.Stat(path); err == nil {
 				candidates = append(candidates, struct {
@@ -961,14 +998,18 @@ func (r *RSyslogAnalyzer) findLogFile() string {
 }
 
 func (r *RSyslogAnalyzer) isSafePath(path string) bool {
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return false
+	originalPath := path
+	for i := 0; i < MaxPointerJumps; i++ {
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return false
+		}
+		path = resolved
 	}
 
-	resolved = filepath.Clean(resolved)
+	resolved := filepath.Clean(path)
 
-	for _, allowed := range ALLOWED_DIRS {
+	for _, allowed := range allowedDirs {
 		allowed = filepath.Clean(allowed)
 		if strings.HasPrefix(resolved, allowed) {
 			rel, err := filepath.Rel(allowed, resolved)
@@ -977,26 +1018,9 @@ func (r *RSyslogAnalyzer) isSafePath(path string) bool {
 			}
 		}
 	}
-	return false
-}
 
-func validateCompressedFile(reader io.Reader, maxIterations int64) error {
-	buf := make([]byte, 1024)
-	var totalRead int64
-	for {
-		n, err := reader.Read(buf)
-		if err != nil && err != io.EOF {
-			return err
-		}
-		totalRead += int64(n)
-		if totalRead > maxIterations {
-			return errors.New("file appears to be a decompression bomb")
-		}
-		if err == io.EOF {
-			break
-		}
-	}
-	return nil
+	slog.Warn("path not in allowed directories", "path", originalPath, "resolved", resolved)
+	return false
 }
 
 func (r *RSyslogAnalyzer) openLogFile(filePath string) (io.ReadCloser, error) {
@@ -1030,14 +1054,22 @@ func (r *RSyslogAnalyzer) openLogFile(filePath string) (io.ReadCloser, error) {
 			file.Close()
 			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
 		}
-		if err := validateCompressedFile(reader, 100*1024*1024); err != nil {
+		validatedReader, err := validateCompressedFile(reader, MaxDecompressedSize)
+		if err != nil {
 			reader.Close()
 			return nil, fmt.Errorf("gzip validation failed: %w", err)
 		}
-		return reader, nil
+		return struct {
+			io.Reader
+			io.Closer
+		}{
+			Reader: validatedReader,
+			Closer: reader,
+		}, nil
 	} else if strings.HasSuffix(filePath, ".bz2") {
 		reader := bzip2.NewReader(file)
-		if err := validateCompressedFile(reader, 100*1024*1024); err != nil {
+		validatedReader, err := validateCompressedFile(reader, MaxDecompressedSize)
+		if err != nil {
 			file.Close()
 			return nil, fmt.Errorf("bzip2 validation failed: %w", err)
 		}
@@ -1045,10 +1077,15 @@ func (r *RSyslogAnalyzer) openLogFile(filePath string) (io.ReadCloser, error) {
 			io.Reader
 			io.Closer
 		}{
-			Reader: bzip2.NewReader(file),
+			Reader: validatedReader,
 			Closer: file,
 		}, nil
 	} else if strings.HasSuffix(filePath, ".xz") {
+		if strings.Contains(resolvedPath, "..") || strings.Contains(resolvedPath, "$") || strings.Contains(resolvedPath, "`") {
+			file.Close()
+			return nil, SecurityError{Message: "potentially dangerous path for xz command"}
+		}
+
 		cmd := exec.Command("xz", "-dc", resolvedPath)
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
@@ -1099,7 +1136,7 @@ func (r *RSyslogAnalyzer) LoadLogsWithContext(ctx context.Context) error {
 
 	scanner := bufio.NewScanner(reader)
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 10*1024*1024)
+	scanner.Buffer(buf, MaxLineLength)
 
 	for scanner.Scan() {
 		select {
